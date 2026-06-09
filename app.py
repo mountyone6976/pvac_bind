@@ -71,6 +71,76 @@ def safe_corr(x, y, method_name):
     return np.nan
 
 
+def first_existing_column(frame, candidates):
+    for column_name in candidates:
+        if column_name in frame.columns:
+            return column_name
+    return None
+
+
+def find_metric_columns(frame, include_terms, exclude_terms=None):
+    exclude_terms = exclude_terms or []
+    matches = []
+    for column_name in frame.columns:
+        normalized = str(column_name).lower()
+        if all(term.lower() in normalized for term in include_terms):
+            if not any(term.lower() in normalized for term in exclude_terms):
+                matches.append(column_name)
+    return matches
+
+
+def add_algorithm_column(frame):
+    algorithm_col = first_existing_column(
+        frame,
+        [
+            "PredictionAlgorithm",
+            "Prediction Algorithm",
+            "Algorithm",
+            "algorithm",
+            "Method",
+            "method",
+        ],
+    )
+    if algorithm_col is None:
+        frame["Algorithm"] = "All algorithms"
+        return "Algorithm"
+    return algorithm_col
+
+
+def add_rna_expression_rank_bins(merged):
+    expressed_genes = (
+        merged[["Gene", "RNAExpr"]]
+        .dropna()
+        .drop_duplicates()
+        .sort_values("RNAExpr", ascending=False)
+        .reset_index(drop=True)
+    )
+    if expressed_genes.empty:
+        merged["RNA expression rank bin"] = "Missing RNA expression"
+        return merged
+
+    expressed_genes["RNA expression rank"] = np.arange(1, len(expressed_genes) + 1)
+    expressed_genes["RNA expression percentile"] = (
+        expressed_genes["RNA expression rank"] / len(expressed_genes) * 100
+    )
+    bin_edges = list(range(0, 101, 10))
+    bin_labels = [f"Top {start + 1}-{end}%" for start, end in zip(bin_edges[:-1], bin_edges[1:])]
+    expressed_genes["RNA expression rank bin"] = pd.cut(
+        expressed_genes["RNA expression percentile"],
+        bins=bin_edges,
+        labels=bin_labels,
+        include_lowest=True,
+    ).astype(str)
+
+    merged = merged.merge(
+        expressed_genes[["Gene", "RNA expression percentile", "RNA expression rank bin"]],
+        on="Gene",
+        how="left",
+    )
+    merged["RNA expression rank bin"] = merged["RNA expression rank bin"].fillna("Missing RNA expression")
+    return merged
+
+
 def build_sidebar_filters(frame):
     filtered = frame.copy()
 
@@ -354,6 +424,8 @@ def show_rna_expression(df, rna_upload):
     merged = pvac.merge(rna_one_gene, on="Gene", how="left")
     merged["RNAExpr_filled"] = merged["RNAExpr"].fillna(0)
     merged["log10_RNAExpr_plus1"] = np.log10(merged["RNAExpr_filled"] + 1)
+    merged = add_rna_expression_rank_bins(merged)
+    algorithm_col = add_algorithm_column(merged)
 
     matched_rows = merged["RNAExpr"].notna().sum()
     missing_rows = merged["RNAExpr"].isna().sum()
@@ -408,6 +480,67 @@ def show_rna_expression(df, rna_upload):
     )
     st.plotly_chart(add_bar_labels(fig), use_container_width=True)
 
+    st.subheader("MS-detected peptides by RNA expression level")
+
+    peptide_count_col = "Best Peptide" if "Best Peptide" in merged.columns else None
+    count_mode = st.radio(
+        "Count peptides by",
+        ["pVACbind rows", "Unique Best Peptide"] if peptide_count_col else ["pVACbind rows"],
+        horizontal=True,
+    )
+
+    bin_order = [f"Top {start + 1}-{end}%" for start, end in zip(range(0, 100, 10), range(10, 101, 10))]
+    bin_order.append("Missing RNA expression")
+    count_col = "MS-detected peptide count"
+
+    if count_mode == "Unique Best Peptide":
+        rna_bin_counts = (
+            merged.dropna(subset=[peptide_count_col])
+            .groupby("RNA expression rank bin", as_index=False)[peptide_count_col]
+            .nunique()
+            .rename(columns={peptide_count_col: count_col})
+        )
+    else:
+        rna_bin_counts = (
+            merged.groupby("RNA expression rank bin", as_index=False)
+            .size()
+            .rename(columns={"size": count_col})
+        )
+
+    rna_bin_counts["RNA expression rank bin"] = pd.Categorical(
+        rna_bin_counts["RNA expression rank bin"],
+        categories=bin_order,
+        ordered=True,
+    )
+    rna_bin_counts = rna_bin_counts.sort_values("RNA expression rank bin")
+    total_detected = rna_bin_counts[count_col].sum()
+    rna_bin_counts["Percent of detected peptides"] = (
+        rna_bin_counts[count_col] / total_detected * 100 if total_detected else 0
+    )
+    rna_bin_counts["Label"] = rna_bin_counts.apply(
+        lambda row: f"{int(row[count_col]):,}<br>{row['Percent of detected peptides']:.1f}%",
+        axis=1,
+    )
+
+    fig = px.bar(
+        rna_bin_counts,
+        x="RNA expression rank bin",
+        y=count_col,
+        text="Label",
+        title="MS-detected peptides from RNA expression deciles",
+        hover_data=["Percent of detected peptides"],
+    )
+    fig.update_traces(textposition="outside", cliponaxis=False)
+    st.plotly_chart(fig, use_container_width=True)
+    st.dataframe(rna_bin_counts, use_container_width=True)
+
+    st.download_button(
+        "Download RNA expression bin summary TSV",
+        rna_bin_counts.to_csv(sep="\t", index=False),
+        file_name="rna_expression_bin_summary.tsv",
+        mime="text/tab-separated-values",
+    )
+
     if "Tier" in merged.columns:
         tier_expr = (
             merged.dropna(subset=["RNAExpr"])
@@ -429,32 +562,77 @@ def show_rna_expression(df, rna_upload):
             for _, row in tier_expr.iterrows():
                 summary_lines.append(f"Median RNAExpr for {row['Tier']}: {row['Median RNAExpr']:.3f}")
 
-    scatter_specs = [
-        ("IC50 MT", "IC50 MT numeric", "RNA expression vs IC50 MT"),
-        ("Pres %ile MT", "Pres %ile MT numeric", "RNA expression vs Pres %ile MT"),
-    ]
+    st.subheader("Algorithm dot plots")
 
-    for source_col, numeric_col, title in scatter_specs:
-        if source_col not in merged.columns:
-            continue
-        numeric_column(merged, source_col, numeric_col)
-        corr_df = merged.dropna(subset=["RNAExpr", numeric_col])
+    metric_groups = {
+        "IC50": find_metric_columns(merged, ["ic50"]),
+        "Binding %ile": find_metric_columns(merged, ["%ile"], ["pres"]),
+        "Presentation score": (
+            find_metric_columns(merged, ["presentation", "score"], ["%ile"])
+            + find_metric_columns(merged, ["pres", "score"], ["%ile"])
+        ),
+        "Presentation %ile": (
+            find_metric_columns(merged, ["presentation", "%ile"])
+            + find_metric_columns(merged, ["pres", "%ile"])
+        ),
+    }
+    metric_groups = {
+        label: list(dict.fromkeys(columns))
+        for label, columns in metric_groups.items()
+        if columns
+    }
+
+    plot_ready_frames = []
+    for metric_label, columns in metric_groups.items():
+        selected_col = st.selectbox(
+            f"{metric_label} column",
+            columns,
+            key=f"rna_metric_{metric_label}",
+        )
+        numeric_col = f"{selected_col} numeric"
+        numeric_column(merged, selected_col, numeric_col)
+        corr_df = merged.dropna(subset=["RNAExpr", numeric_col]).copy()
         if len(corr_df) > 1:
             pearson_value = safe_corr(corr_df["RNAExpr"], corr_df[numeric_col], "pearson")
             spearman_value = safe_corr(corr_df["RNAExpr"], corr_df[numeric_col], "spearman")
-            summary_lines.append(f"RNAExpr vs {source_col} Pearson correlation: {pearson_value:.4f}")
-            summary_lines.append(f"RNAExpr vs {source_col} Spearman correlation: {spearman_value:.4f}")
+            summary_lines.append(f"RNAExpr vs {selected_col} Pearson correlation: {pearson_value:.4f}")
+            summary_lines.append(f"RNAExpr vs {selected_col} Spearman correlation: {spearman_value:.4f}")
 
             plot_df = corr_df.sample(min(5000, len(corr_df)), random_state=1)
             hover_cols = [col for col in ["Gene", "Best Peptide", "Allele", "Tier"] if col in plot_df.columns]
+            algorithm_count = plot_df[algorithm_col].nunique()
             fig = px.scatter(
                 plot_df,
                 x="RNAExpr",
                 y=numeric_col,
+                color=algorithm_col,
+                facet_col=algorithm_col if 1 < algorithm_count <= 6 else None,
+                facet_col_wrap=3,
                 hover_data=hover_cols,
-                title=title,
+                title=f"Raw RNA expression vs {metric_label} by algorithm",
             )
+            fig.update_layout(showlegend=algorithm_count > 6)
             st.plotly_chart(fig, use_container_width=True)
+            export_cols = [algorithm_col, "Gene", "RNAExpr", selected_col, numeric_col]
+            export_cols.extend([col for col in ["Best Peptide", "Allele", "Tier"] if col in corr_df.columns])
+            export_df = corr_df[export_cols].copy()
+            export_df["Metric"] = metric_label
+            export_df["Metric column"] = selected_col
+            plot_ready_frames.append(export_df)
+
+    if plot_ready_frames:
+        algorithm_plot_data = pd.concat(plot_ready_frames, ignore_index=True)
+        st.download_button(
+            "Download algorithm dot plot data TSV",
+            algorithm_plot_data.to_csv(sep="\t", index=False),
+            file_name="algorithm_dot_plot_data.tsv",
+            mime="text/tab-separated-values",
+        )
+    else:
+        st.info(
+            "No algorithm metric columns were found for IC50, binding percentile, "
+            "presentation score, or presentation percentile."
+        )
 
     st.header("Top expressed source genes")
 
