@@ -562,77 +562,65 @@ def show_rna_expression(df, rna_upload):
             for _, row in tier_expr.iterrows():
                 summary_lines.append(f"Median RNAExpr for {row['Tier']}: {row['Median RNAExpr']:.3f}")
 
-    st.subheader("Algorithm dot plots")
+    st.subheader("IC50 and raw RNA expression by algorithm")
 
-    metric_groups = {
-        "IC50": find_metric_columns(merged, ["ic50"]),
-        "Binding %ile": find_metric_columns(merged, ["%ile"], ["pres"]),
-        "Presentation score": (
-            find_metric_columns(merged, ["presentation", "score"], ["%ile"])
-            + find_metric_columns(merged, ["pres", "score"], ["%ile"])
-        ),
-        "Presentation %ile": (
-            find_metric_columns(merged, ["presentation", "%ile"])
-            + find_metric_columns(merged, ["pres", "%ile"])
-        ),
-    }
-    metric_groups = {
-        label: list(dict.fromkeys(columns))
-        for label, columns in metric_groups.items()
-        if columns
-    }
+    ic50_columns = [
+        col
+        for col in find_metric_columns(merged, ["ic50"])
+        if "numeric" not in str(col).lower()
+    ]
 
-    plot_ready_frames = []
-    for metric_label, columns in metric_groups.items():
-        selected_col = st.selectbox(
-            f"{metric_label} column",
-            columns,
-            key=f"rna_metric_{metric_label}",
-        )
-        numeric_col = f"{selected_col} numeric"
-        numeric_column(merged, selected_col, numeric_col)
-        corr_df = merged.dropna(subset=["RNAExpr", numeric_col]).copy()
-        if len(corr_df) > 1:
-            pearson_value = safe_corr(corr_df["RNAExpr"], corr_df[numeric_col], "pearson")
-            spearman_value = safe_corr(corr_df["RNAExpr"], corr_df[numeric_col], "spearman")
-            summary_lines.append(f"RNAExpr vs {selected_col} Pearson correlation: {pearson_value:.4f}")
-            summary_lines.append(f"RNAExpr vs {selected_col} Spearman correlation: {spearman_value:.4f}")
+    if ic50_columns:
+        selected_ic50_col = st.selectbox("IC50 column", ic50_columns, key="rna_ic50_column")
+        ic50_numeric_col = f"{selected_ic50_col} numeric"
+        numeric_column(merged, selected_ic50_col, ic50_numeric_col)
+        ic50_plot_data = merged.dropna(subset=["RNAExpr", ic50_numeric_col]).copy()
 
-            plot_df = corr_df.sample(min(5000, len(corr_df)), random_state=1)
-            hover_cols = [col for col in ["Gene", "Best Peptide", "Allele", "Tier"] if col in plot_df.columns]
-            algorithm_count = plot_df[algorithm_col].nunique()
-            fig = px.scatter(
-                plot_df,
-                x="RNAExpr",
-                y=numeric_col,
-                color=algorithm_col,
-                facet_col=algorithm_col if 1 < algorithm_count <= 6 else None,
-                facet_col_wrap=3,
-                hover_data=hover_cols,
-                title=f"Raw RNA expression vs {metric_label} by algorithm",
+        if ic50_plot_data.empty:
+            st.info("No rows have both raw RNA expression and IC50 values.")
+        else:
+            hover_cols = [
+                col
+                for col in ["Gene", "Best Peptide", "Allele", "Tier", algorithm_col]
+                if col in ic50_plot_data.columns
+            ]
+            algorithms = sorted(ic50_plot_data[algorithm_col].dropna().astype(str).unique())
+
+            for algorithm in algorithms:
+                algorithm_df = ic50_plot_data[ic50_plot_data[algorithm_col].astype(str) == algorithm]
+                if algorithm_df.empty:
+                    continue
+
+                pearson_value = safe_corr(algorithm_df["RNAExpr"], algorithm_df[ic50_numeric_col], "pearson")
+                spearman_value = safe_corr(algorithm_df["RNAExpr"], algorithm_df[ic50_numeric_col], "spearman")
+                summary_lines.append(
+                    f"{algorithm} RNAExpr vs {selected_ic50_col} Pearson correlation: {pearson_value:.4f}"
+                )
+                summary_lines.append(
+                    f"{algorithm} RNAExpr vs {selected_ic50_col} Spearman correlation: {spearman_value:.4f}"
+                )
+
+                fig = px.scatter(
+                    algorithm_df,
+                    x="RNAExpr",
+                    y=ic50_numeric_col,
+                    hover_data=hover_cols,
+                    title=f"{algorithm}: raw RNA expression vs {selected_ic50_col}",
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+            export_cols = [algorithm_col, "Gene", "RNAExpr", selected_ic50_col, ic50_numeric_col]
+            export_cols.extend(
+                [col for col in ["Best Peptide", "Allele", "Tier"] if col in ic50_plot_data.columns]
             )
-            fig.update_layout(showlegend=algorithm_count > 6)
-            st.plotly_chart(fig, use_container_width=True)
-            export_cols = [algorithm_col, "Gene", "RNAExpr", selected_col, numeric_col]
-            export_cols.extend([col for col in ["Best Peptide", "Allele", "Tier"] if col in corr_df.columns])
-            export_df = corr_df[export_cols].copy()
-            export_df["Metric"] = metric_label
-            export_df["Metric column"] = selected_col
-            plot_ready_frames.append(export_df)
-
-    if plot_ready_frames:
-        algorithm_plot_data = pd.concat(plot_ready_frames, ignore_index=True)
-        st.download_button(
-            "Download algorithm dot plot data TSV",
-            algorithm_plot_data.to_csv(sep="\t", index=False),
-            file_name="algorithm_dot_plot_data.tsv",
-            mime="text/tab-separated-values",
-        )
+            st.download_button(
+                "Download raw RNA expression vs IC50 data TSV",
+                ic50_plot_data[export_cols].to_csv(sep="\t", index=False),
+                file_name="raw_rna_expression_vs_ic50_by_algorithm.tsv",
+                mime="text/tab-separated-values",
+            )
     else:
-        st.info(
-            "No algorithm metric columns were found for IC50, binding percentile, "
-            "presentation score, or presentation percentile."
-        )
+        st.info("No IC50 columns were found for raw RNA expression dot plots.")
 
     st.header("Top expressed source genes")
 
