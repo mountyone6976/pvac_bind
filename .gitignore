@@ -1,0 +1,7 @@
+.venv/
+*.tsv
+*.fasta
+*_output/
+__pycache__/
+.DS_Store
+.env
